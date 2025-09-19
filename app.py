@@ -1,54 +1,38 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 from flask import Flask, request, jsonify
-import os
-import json
-import base64
-import logging
-import requests
+import os, json, base64, logging, requests
 from datetime import datetime
 from Crypto.Cipher import AES
 from Crypto.Util.Padding import unpad
 
-"""
-ClickBank INS v8 -> GA4 Measurement Protocol bridge
-
-Environment variables required:
-  - GA4_MEASUREMENT_ID  (e.g., G-XXXXXXXXXX)
-  - GA4_API_SECRET      (from GA4 Data Stream > Measurement Protocol API secrets)
-  - CLICKBANK_SECRET_KEY (same key you set in ClickBank Advanced Tools; 16 chars recommended)
-
-Optional:
-  - DEFAULT_CLIENT_ID (fallback if you cannot pass client_id from site to ClickBank; format "12345.67890")
-  - FORCE_HTTPS_VERIFY=false (to disable SSL verification in dev only)
-"""
-
 app = Flask(__name__)
+app.url_map.strict_slashes = False  # accept /route and /route/
 
-# Basic logging
+# ------------ CONFIG / ENV ------------
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 
-GA4_MEASUREMENT_ID = os.getenv("GA4_MEASUREMENT_ID", "G-XXXXXXX")
-GA4_API_SECRET = os.getenv("GA4_API_SECRET", "YOUR_API_SECRET")
+GA4_MEASUREMENT_ID = os.getenv("GA4_MEASUREMENT_ID", "")
+GA4_API_SECRET = os.getenv("GA4_API_SECRET", "")
 CLICKBANK_SECRET_KEY = os.getenv("CLICKBANK_SECRET_KEY", "")
 DEFAULT_CLIENT_ID = os.getenv("DEFAULT_CLIENT_ID", "555.777")
 FORCE_HTTPS_VERIFY = os.getenv("FORCE_HTTPS_VERIFY", "true").lower() != "false"
 
-GA4_ENDPOINT = f"https://www.google-analytics.com/mp/collect?measurement_id={GA4_MEASUREMENT_ID}&api_secret={GA4_API_SECRET}"
+GA4_ENDPOINT = (
+    f"https://www.google-analytics.com/mp/collect?measurement_id={GA4_MEASUREMENT_ID}&api_secret={GA4_API_SECRET}"
+    if GA4_MEASUREMENT_ID and GA4_API_SECRET else None
+)
 
+# ------------ HELPERS ------------
 def _derive_aes_key(secret: str) -> bytes:
-    """Ensure AES key is 16/24/32 bytes by padding/truncating deterministically."""
-    key_bytes = secret.encode("utf-8")
-    if len(key_bytes) in (16, 24, 32):
-        return key_bytes
-    if len(key_bytes) < 16:
-        return key_bytes.ljust(16, b"\0")
-    if len(key_bytes) <= 24:
-        return key_bytes[:24].ljust(24, b"\0")
+    """Ensure AES key size 16/24/32 bytes by padding/truncating."""
+    key_bytes = (secret or "").encode("utf-8")
+    if len(key_bytes) in (16, 24, 32): return key_bytes
+    if len(key_bytes) < 16: return key_bytes.ljust(16, b"\0")
+    if len(key_bytes) <= 24: return key_bytes[:24].ljust(24, b"\0")
     return key_bytes[:32].ljust(32, b"\0")
 
 def decrypt_ins_v8(notification_b64: str, iv_b64: str, secret_key: str) -> dict:
-    """Decrypt ClickBank INS v8 payload (AES/CBC) -> dict"""
     if not secret_key:
         raise ValueError("CLICKBANK_SECRET_KEY is not set")
     key = _derive_aes_key(secret_key)
@@ -59,39 +43,36 @@ def decrypt_ins_v8(notification_b64: str, iv_b64: str, secret_key: str) -> dict:
     return json.loads(plaintext.decode("utf-8"))
 
 def extract_purchase_params(ins: dict) -> dict:
-    """Map ClickBank fields -> GA4 purchase params."""
-    tx_type = ins.get("transactionType", "").upper()
+    tx_type = (ins.get("transactionType") or "").upper()
     if tx_type not in ("SALE", "TEST_SALE", "BILL", "TEST_BILL"):
         raise ValueError(f"Skipping non-sale transactionType: {tx_type}")
-
     receipt = ins.get("receipt") or ins.get("attempt", {}).get("receipt")
+
+    # amount
     amount = None
     for k in ("totalProductAmount", "totalAccountAmount", "orderTotal"):
         v = ins.get(k) or ins.get("transactionItem", {}).get(k)
         if v is not None:
             try:
-                amount = float(v)
-                break
+                amount = float(v); break
             except Exception:
                 pass
-    if amount is None:
-        amount = 0.0
+    if amount is None: amount = 0.0
 
     currency = ins.get("currency") or ins.get("attempt", {}).get("currency") or "USD"
 
-    client_id = os.getenv("DEFAULT_CLIENT_ID", "555.777")
+    # client_id from trackingCodes (prefer 'cid:12345.67890' or '_ga=...')
+    client_id = DEFAULT_CLIENT_ID
     tracking_codes = ins.get("trackingCodes") or ins.get("attempt", {}).get("trackingCodes") or []
     if isinstance(tracking_codes, list):
         for code in tracking_codes:
             if isinstance(code, str):
                 if code.startswith("cid:"):
-                    client_id = code[4:].strip()
-                    break
+                    client_id = code[4:].strip(); break
                 if code.startswith("_ga="):
                     parts = code.split(".")
                     if len(parts) >= 4:
-                        client_id = f"{parts[-2]}.{parts[-1]}"
-                        break
+                        client_id = f"{parts[-2]}.{parts[-1]}"; break
 
     params = {
         "transaction_id": str(receipt) if receipt else f"CB-{int(datetime.utcnow().timestamp())}",
@@ -99,64 +80,92 @@ def extract_purchase_params(ins: dict) -> dict:
         "currency": currency,
     }
 
+    # optional items
     items = []
-    line_items = ins.get("lineItems") or []
-    if isinstance(line_items, list):
-        for li in line_items:
-            name = li.get("productTitle") or li.get("itemNo") or "Item"
-            price = li.get("itemAmount") or li.get("price") or amount
-            try:
-                price = float(price)
-            except Exception:
-                price = amount
-            items.append({
-                "item_name": str(name)[:100],
-                "price": round(price, 2),
-                "quantity": int(li.get("quantity", 1)),
-            })
-    if items:
-        params["items"] = items
+    for li in ins.get("lineItems") or []:
+        name = li.get("productTitle") or li.get("itemNo") or "Item"
+        price = li.get("itemAmount") or li.get("price") or amount
+        try: price = float(price)
+        except Exception: price = amount
+        items.append({"item_name": str(name)[:100], "price": round(price, 2), "quantity": int(li.get("quantity", 1))})
+    if items: params["items"] = items
 
     return {"client_id": client_id, "params": params}
 
-def post_to_ga4(client_id: str, params: dict) -> requests.Response:
-    payload = {
-        "client_id": client_id,
-        "events": [{"name": "purchase", "params": params}]
-    }
+def post_to_ga4(client_id: str, params: dict):
+    if not GA4_ENDPOINT:
+        raise ValueError("GA4 endpoint not configured (missing GA4_MEASUREMENT_ID or GA4_API_SECRET).")
+    payload = {"client_id": client_id, "events": [{"name": "purchase", "params": params}]}
     verify = FORCE_HTTPS_VERIFY
-    resp = requests.post(GA4_ENDPOINT, json=payload, timeout=10, verify=verify)
-    return resp
+    return requests.post(GA4_ENDPOINT, json=payload, timeout=10, verify=verify)
+
+# ------------ ROUTES ------------
+@app.route("/", methods=["GET"])
+def root():
+    return jsonify({"status": "ok", "service": "clickbank-ins-ga4"}), 200
 
 @app.route("/health", methods=["GET"])
 def health():
     return jsonify({"status": "ok", "ga4": GA4_MEASUREMENT_ID}), 200
 
-@app.route("/clickbank/ins", methods=["POST"])
+@app.route("/debug", methods=["GET"])
+def debug():
+    return jsonify({
+        "has_ga4_id": bool(GA4_MEASUREMENT_ID),
+        "has_api_secret": bool(GA4_API_SECRET),
+        "clickbank_secret_len": len(CLICKBANK_SECRET_KEY or ""),
+        "strict_slashes": False
+    }), 200
+
+@app.route("/clickbank/ins-echo", methods=["GET","POST"])
+def clickbank_ins_echo():
+    body_json = request.get_json(silent=True)
+    form_fields = {k: v for k, v in request.form.items()}
+    return jsonify({
+        "ok": True, "method": request.method,
+        "has_json": bool(body_json),
+        "has_form": bool(form_fields),
+        "form_keys": list(form_fields.keys())
+    }), 200
+
+@app.route("/clickbank/ins", methods=["GET", "POST"])
 def clickbank_ins():
+    if request.method == "GET":
+        return jsonify({"status": "ready"}), 200
     try:
-        body = request.get_json(force=True, silent=False)
-        if not body:
-            return jsonify({"error": "Empty body"}), 400
-
-        notification_b64 = body.get("notification")
-        iv_b64 = body.get("iv")
+        # Stage 1: read body
+        body_json = request.get_json(silent=True) or {}
+        notification_b64 = body_json.get("notification") or request.form.get("notification")
+        iv_b64 = body_json.get("iv") or request.form.get("iv")
         if not notification_b64 or not iv_b64:
-            return jsonify({"error": "Missing 'notification' or 'iv' fields"}), 400
+            return jsonify({"error": "Missing 'notification' or 'iv' (json or form).", "stage": "validate-input"}), 400
 
-        ins = decrypt_ins_v8(notification_b64, iv_b64, CLICKBANK_SECRET_KEY)
+        # Stage 2: decrypt
+        try:
+            ins = decrypt_ins_v8(notification_b64, iv_b64, CLICKBANK_SECRET_KEY)
+        except Exception as e:
+            return jsonify({"error": f"decrypt_failed: {str(e)}", "stage": "decrypt"}), 500
 
-        mapped = extract_purchase_params(ins)
-        resp = post_to_ga4(mapped["client_id"], mapped["params"])
+        # Stage 3: map
+        try:
+            mapped = extract_purchase_params(ins)
+        except Exception as e:
+            return jsonify({"error": f"map_failed: {str(e)}", "stage": "map"}), 500
+
+        # Stage 4: post to GA4
+        try:
+            resp = post_to_ga4(mapped["client_id"], mapped["params"])
+        except Exception as e:
+            return jsonify({"error": f"ga4_post_failed: {str(e)}", "stage": "ga4"}), 502
 
         if not (200 <= resp.status_code < 300):
-            return jsonify({"status": "ins_ok", "ga4_status": resp.status_code, "ga4_error": resp.text}), 502
+            return jsonify({"status": "ins_ok", "ga4_status": resp.status_code, "ga4_error": resp.text, "stage": "ga4"}), 502
 
         return jsonify({"status": "ok", "ga4_status": resp.status_code}), 200
 
     except Exception as e:
-        return jsonify({"error": str(e)}), 500
+        return jsonify({"error": f"unexpected: {str(e)}", "stage": "catch-all"}), 500
 
 if __name__ == "__main__":
-    port = int(os.getenv("PORT", "8080"))
+    port = int(os.getenv("PORT", "10000"))
     app.run(host="0.0.0.0", port=port)
